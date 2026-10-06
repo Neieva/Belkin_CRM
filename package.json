@@ -1,0 +1,8 @@
+{
+  "name": "belkin-crm",
+  "version": "0.1.0",
+  "description": "Простая CRM для маркетингового агентства: проекты, оплаты, задачи, документы",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "license": "UNLICENSED"
+}
