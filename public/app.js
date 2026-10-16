@@ -355,7 +355,8 @@ function tabProcesses(p, rerender) {
     services.length ? services.map((s) => h('div', { class: 'panel proc-group' }, h('h3', {}, s),
       p.processes.filter((x) => x.service === s).map((x) => h('div', { class: 'list-item' },
         h('div', { class: 'grow' }, h('div', {}, x.name), x.note && h('div', { class: 'meta muted' }, x.note)),
-        x.owner ? h('span', {}, h('span', { class: 'avatar' }, initials(x.owner)), x.owner) : chip('не назначен', 'warn'),
+        h('input', { class: 'inline-owner', list: 'people', placeholder: 'Назначить…', value: x.owner || '', title: 'Ответственный: нажмите и выберите или впишите имя',
+          onchange: (e) => { x.owner = e.target.value.trim(); e.target.blur(); save(); setTimeout(rerender, 0); } }),
         h('button', { class: 'btn small', onclick: () => edit(x) }, 'Изменить')))))
       : h('div', { class: 'empty panel' }, 'Выберите направления в «Параметры» или добавьте процесс вручную'));
 }
@@ -486,6 +487,8 @@ function tabNotes(p, rerender) {
     } }, 'Добавить заметку')),
     h('div', { style: 'margin-top:14px' }, p.notes.map((n) => h('div', { class: 'note' },
       h('small', {}, new Date(n.date).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }), ' · ',
+        h('a', { href: '#', onclick: (e) => { e.preventDefault(); openForm({ title: 'Заметка', values: n, fields: [{ key: 'text', label: 'Текст', type: 'textarea', required: true }],
+          onSave: (v) => { n.text = v.text; save(); rerender(); } }); } }, 'изменить'), ' · ',
         h('a', { href: '#', onclick: (e) => { e.preventDefault(); ask('Удалить заметку?', () => { p.notes = p.notes.filter((x) => x !== n); save(); rerender(); }); } }, 'удалить')),
       h('div', { class: 'pre' }, n.text)))));
 }
@@ -520,7 +523,8 @@ function viewPayments() {
         h('td', {}, isOverdue(x) && chip('Просрочена', 'bad')),
         h('td', { class: 'num' }, x.status !== 'Оплачено'
           ? h('button', { class: 'btn small', onclick: () => { x.status = 'Оплачено'; save(); route(); } }, 'Оплачено')
-          : h('button', { class: 'btn small ghost', onclick: () => { x.status = 'Ожидается'; save(); route(); } }, 'Вернуть'))))))))
+          : h('button', { class: 'btn small ghost', onclick: () => { x.status = 'Ожидается'; save(); route(); } }, 'Вернуть'),
+          ' ', h('button', { class: 'btn small ghost', onclick: () => payForm(p, x, route) }, 'Изменить'))))))))
       : h('div', { class: 'empty panel' }, 'Здесь пока пусто'));
 }
 
@@ -541,13 +545,27 @@ function viewTasks() {
     h('div', { class: 'panel' }, rows.length ? h('table', {}, h('tbody', {}, rows.map(({ p, t }) => h('tr', { class: t.status === 'Готово' ? 'done' : taskOverdue(t) ? 'overdue' : '' },
       h('td', { style: 'width:30px' }, h('input', { type: 'checkbox', style: 'width:auto', checked: t.status === 'Готово',
         onchange: (e) => { t.status = e.target.checked ? 'Готово' : 'К выполнению'; save(); route(); } })),
-      h('td', {}, t.title), h('td', {}, h('a', { href: `#/p/${p.id}/tasks` }, p.client)),
+      h('td', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); taskForm(p, t, route); } }, t.title)), h('td', {}, h('a', { href: `#/p/${p.id}/tasks` }, p.client)),
       h('td', { class: 'muted' }, t.assignee), h('td', {}, t.service && chip(t.service)),
       h('td', { class: 'num' }, t.due && h('span', { class: taskOverdue(t) ? 'bad' : '', style: taskOverdue(t) ? 'color:var(--bad);font-weight:600' : '' }, fmtDate(t.due)))))))
       : h('div', { class: 'empty' }, 'Задач нет 🎉')));
 }
 
 // ---------- экран: команда ----------
+function renamePerson(oldName) {
+  openForm({
+    title: 'Переименовать сотрудника', values: { name: oldName }, fields: [{ key: 'name', label: 'Имя (поменяется во всех проектах и задачах)', required: true }],
+    onSave: ({ name }) => {
+      for (const p of db.projects) {
+        if (p.manager === oldName) p.manager = name;
+        p.processes.forEach((x) => { if (x.owner === oldName) x.owner = name; });
+        p.tasks.forEach((t) => { if (t.assignee === oldName) t.assignee = name; });
+      }
+      save(); route();
+    },
+  });
+}
+
 function viewTeam() {
   const people = allPeople();
   return h('div', {}, h('h1', {}, 'Команда'), h('div', { class: 'sub' }, 'Кто за что отвечает и сколько на ком проектов'),
@@ -557,7 +575,8 @@ function viewTeam() {
       const tasks = db.projects.flatMap((p) => p.tasks).filter((t) => t.assignee === n && t.status !== 'Готово');
       const projects = new Set([...procs.map((r) => r.p), ...managed]);
       return h('div', { class: 'card', style: 'cursor:default' },
-        h('div', { class: 'row' }, h('span', { class: 'avatar', style: 'width:34px;height:34px;font-size:13px' }, initials(n)), h('h3', {}, n)),
+        h('div', { class: 'row' }, h('span', { class: 'avatar', style: 'width:34px;height:34px;font-size:13px' }, initials(n)), h('h3', {}, n), h('span', { class: 'spacer' }),
+          h('button', { class: 'btn small ghost', onclick: () => renamePerson(n) }, 'Переименовать')),
         h('div', { class: 'meta' }, `Проектов: ${projects.size} · открытых задач: ${tasks.length} (просрочено ${tasks.filter(taskOverdue).length})`),
         managed.length > 0 && h('div', {}, h('div', { class: 'field-label' }, 'Ведёт проекты'),
           managed.map((p) => h('a', { href: `#/p/${p.id}/overview`, style: 'margin-right:8px' }, p.client))),
