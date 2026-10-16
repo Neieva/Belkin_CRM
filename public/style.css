@@ -156,3 +156,8 @@ dialog label { display: block; font-size: 12px; color: var(--muted); margin: 12p
   main { padding: 18px 14px 50px; }
   .kanban { grid-template-columns: 1fr; }
 }
+
+a { color: var(--accent); }
+.brand { white-space: nowrap; }
+.panel { overflow-x: auto; min-width: 0; }
+.card, .stat, .col { min-width: 0; }

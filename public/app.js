@@ -131,6 +131,19 @@ function demoData() {
 }
 
 // ---------- модальные формы ----------
+const UPLOAD_ERROR = 'Не удалось загрузить файл (слишком большой).';
+
+// Подтверждение внутри страницы: window.confirm в некоторых окнах просмотра отключён.
+function ask(message, onYes) {
+  const dlg = h('dialog', {}, h('h2', {}, message),
+    h('div', { class: 'actions' },
+      onYes && h('button', { class: 'btn danger', onclick: () => { dlg.close(); onYes(); } }, 'Да, удалить'),
+      h('button', { class: 'btn', onclick: () => dlg.close() }, onYes ? 'Отмена' : 'Понятно')));
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
 function openForm({ title, fields, values = {}, onSave, onDelete, saveLabel = 'Сохранить' }) {
   const dlg = h('dialog');
   const inputs = {};
@@ -158,7 +171,7 @@ function openForm({ title, fields, values = {}, onSave, onDelete, saveLabel = '�
   if (onDelete) {
     actions.append(h('span', { class: 'spacer' }), h('button', {
       type: 'button', class: 'btn danger',
-      onclick: () => { if (confirm('Удалить? Это действие нельзя отменить.')) { dlg.close(); onDelete(); } },
+      onclick: () => ask('Удалить? Это действие нельзя отменить.', () => { dlg.close(); onDelete(); }),
     }, 'Удалить'));
   }
   form.append(actions);
@@ -447,7 +460,7 @@ function tabDocs(p, rerender) {
     const f = e.target.files[0];
     if (!f) return;
     const r = await fetch('/api/upload?name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
-    if (!r.ok) return alert('Не удалось загрузить файл (лимит 25 МБ)');
+    if (!r.ok) return ask(UPLOAD_ERROR);
     const j = await r.json();
     add({ title: f.name, url: j.url });
   } });
@@ -460,7 +473,7 @@ function tabDocs(p, rerender) {
       chip(d.type, d.type === 'Договор' ? 'ok' : ''),
       h('div', { class: 'grow' }, d.url && /^(https?:\/\/|\/files\/)/.test(d.url) ? h('a', { href: d.url, target: '_blank', rel: 'noopener' }, d.title) : d.title),
       h('span', { class: 'muted' }, fmtDate(d.date)),
-      h('button', { class: 'btn small danger ghost', onclick: () => { if (confirm('Удалить документ из списка?')) { p.documents = p.documents.filter((x) => x !== d); save(); rerender(); } } }, '✕')))
+      h('button', { class: 'btn small danger ghost', onclick: () => ask('Удалить документ из списка?', () => { p.documents = p.documents.filter((x) => x !== d); save(); rerender(); }) }, '✕')))
       : h('div', { class: 'empty' }, 'Документов пока нет')));
 }
 
@@ -473,7 +486,7 @@ function tabNotes(p, rerender) {
     } }, 'Добавить заметку')),
     h('div', { style: 'margin-top:14px' }, p.notes.map((n) => h('div', { class: 'note' },
       h('small', {}, new Date(n.date).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }), ' · ',
-        h('a', { href: '#', onclick: (e) => { e.preventDefault(); if (confirm('Удалить заметку?')) { p.notes = p.notes.filter((x) => x !== n); save(); rerender(); } } }, 'удалить')),
+        h('a', { href: '#', onclick: (e) => { e.preventDefault(); ask('Удалить заметку?', () => { p.notes = p.notes.filter((x) => x !== n); save(); rerender(); }); } }, 'удалить')),
       h('div', { class: 'pre' }, n.text)))));
 }
 
@@ -587,8 +600,7 @@ async function init() {
   db = await r.json();
   if (db.empty) { db = demoData(); save(); }
   document.getElementById('demo-clear').addEventListener('click', () => {
-    if (!confirm('Удалить демо-проекты и начать с чистого листа?')) return;
-    db = { projects: [] }; save(); location.hash = '#/'; route();
+    ask('Удалить демо-проекты и начать с чистого листа?', () => { db = { projects: [] }; save(); location.hash = '#/'; route(); });
   });
   window.addEventListener('hashchange', () => { window.scrollTo(0, 0); route(); });
   route();
