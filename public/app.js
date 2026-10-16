@@ -63,6 +63,62 @@ const nextPayment = (p) => p.payments.filter((x) => x.status !== 'Оплачен
 const openTasks = (p) => p.tasks.filter((t) => t.status !== 'Готово');
 const taskOverdue = (t) => t.status !== 'Готово' && t.due && t.due < today();
 
+const REPEATS = ['Нет', 'Каждую неделю', 'Каждые 2 недели', 'Каждый месяц'];
+
+function shiftDate(s, repeat) {
+  if (repeat === 'Каждую неделю') return addDays(s, 7);
+  if (repeat === 'Каждые 2 недели') return addDays(s, 14);
+  const d = new Date(s + 'T00:00:00');
+  d.setMonth(d.getMonth() + 1);
+  return iso(d);
+}
+
+// Повторяющаяся задача: когда её закрывают, появляется следующая.
+function setTaskStatus(p, t, status) {
+  const prev = t.status;
+  t.status = status;
+  if (status === 'Готово' && prev !== 'Готово' && t.repeat && t.repeat !== 'Нет' && !t.spawned) {
+    t.spawned = true;
+    const base = t.due && t.due >= today() ? t.due : today();
+    p.tasks.push({ ...t, id: uid(), status: 'К выполнению', due: shiftDate(base, t.repeat), spawned: false });
+  }
+}
+
+// Автопродление: в графике всегда есть минимум два ближайших неоплаченных платежа.
+function ensureSchedule(p) {
+  if (p.autoRenew === false || !p.amount || p.status === 'Завершён') return;
+  const unpaid = p.payments.filter((x) => x.status !== 'Оплачено').length;
+  if (unpaid >= 2) return;
+  const last = p.payments[p.payments.length - 1];
+  generatePayments(p, last ? addDays(last.date, p.periodDays) : today(), 2 - unpaid);
+}
+
+function markPaid(p, x) {
+  x.status = 'Оплачено';
+  ensureSchedule(p);
+  save();
+}
+
+const startOfWeek = (s) => addDays(s, -((new Date(s + 'T00:00:00').getDay() + 6) % 7));
+
+const TEMPLATES = {
+  'Пустой проект': { services: [], tasks: [] },
+  'SMM-ведение': { services: ['SMM'], tasks: [
+    ['Бриф и анализ аккаунта', 'SMM', 2], ['Контент-план на месяц', 'SMM', 5], ['Оформление профиля', 'SMM', 7],
+    ['Первые публикации', 'SMM', 10], ['Ежемесячный отчёт клиенту', 'SMM', 30, 'Каждый месяц']] },
+  'Таргетированная реклама': { services: ['Таргет'], tasks: [
+    ['Бриф и цели кампании', 'Таргет', 2], ['Аудитории и пиксель', 'Таргет', 4], ['Креативы', 'Таргет', 7],
+    ['Запуск тестовых кампаний', 'Таргет', 10], ['Отчёт по рекламе', 'Таргет', 14, 'Каждые 2 недели']] },
+  'Контекстная реклама': { services: ['Контекст'], tasks: [
+    ['Бриф и цели', 'Контекст', 2], ['Сбор семантики', 'Контекст', 5], ['Объявления и настройка', 'Контекст', 9],
+    ['Запуск кампаний', 'Контекст', 12], ['Отчёт по контексту', 'Контекст', 14, 'Каждые 2 недели']] },
+  'Сайт под ключ': { services: ['Сайты'], tasks: [
+    ['ТЗ и структура', 'Сайты', 5], ['Дизайн', 'Сайты', 14], ['Разработка', 'Сайты', 28], ['Тестирование и запуск', 'Сайты', 35]] },
+  'SMM + Таргет': { services: ['SMM', 'Таргет'], tasks: [
+    ['Бриф и анализ аккаунта', 'SMM', 2], ['Контент-план на месяц', 'SMM', 5], ['Аудитории и пиксель', 'Таргет', 5],
+    ['Креативы для рекламы', 'Таргет', 8], ['Ежемесячный отчёт клиенту', 'SMM', 30, 'Каждый месяц']] },
+};
+
 function allPeople() {
   const s = new Set();
   for (const p of db.projects) {
@@ -79,11 +135,18 @@ function makeProject(v) {
     services: v.services || [], amount: Number(v.amount) || 0, periodDays: Number(v.periodDays) || 14,
     brief: { goal: v.goal || '', preferences: v.preferences || '', avoid: v.avoid || '', contactName: v.contactName || '',
       contactPhone: v.contactPhone || '', contactEmail: v.contactEmail || '', links: v.links || '' },
+    autoRenew: v.autoRenew !== false,
     processes: [], tasks: [], payments: [], documents: [], notes: [],
   };
+  const tpl = TEMPLATES[v.template] || TEMPLATES['Пустой проект'];
+  p.services = [...new Set([...p.services, ...tpl.services])];
   for (const s of p.services) {
     for (const name of STD_PROCESSES[s] || []) p.processes.push({ id: uid(), service: s, name, owner: p.manager, note: '' });
   }
+  for (const [title, service, days, repeat] of tpl.tasks) {
+    p.tasks.push({ id: uid(), title, service, assignee: p.manager, due: addDays(today(), days), status: 'К выполнению', repeat: repeat || 'Нет' });
+  }
+  if (v.firstPayment && p.amount > 0) generatePayments(p, v.firstPayment, 2);
   return p;
 }
 
@@ -200,27 +263,116 @@ const projectFields = [
   { key: 'services', label: 'Направления', type: 'checks', options: SERVICES },
   { key: 'amount', label: 'Сумма за период, ₽', type: 'number' },
   { key: 'periodDays', label: 'Период предоплаты, дней', type: 'number', default: 14 },
+  { key: 'autoRenew', label: 'Автопродление графика оплат', type: 'select', options: ['Да', 'Нет'] },
+];
+const newProjectFields = [
+  { key: 'template', label: 'Шаблон (добавит процессы и типовые задачи)', type: 'select', options: Object.keys(TEMPLATES) },
+  ...projectFields,
+  { key: 'firstPayment', label: 'Дата первой оплаты (создаст график)', type: 'date' },
 ];
 
 function editProject(p, rerender) {
   const isNew = !p;
-  const values = isNew ? {} : { ...p };
+  const values = isNew ? { autoRenew: 'Да', firstPayment: today() } : { ...p, autoRenew: p.autoRenew === false ? 'Нет' : 'Да' };
   openForm({
-    title: isNew ? 'Новый проект' : 'Параметры проекта', fields: projectFields, values,
+    title: isNew ? 'Новый проект' : 'Параметры проекта', fields: isNew ? newProjectFields : projectFields, values,
     onSave: (v) => {
       if (isNew) {
-        const np = makeProject(v);
+        const np = makeProject({ ...v, autoRenew: v.autoRenew !== 'Нет' });
         db.projects.push(np);
         save();
         location.hash = '#/p/' + np.id + '/overview';
         return;
       }
       Object.assign(p, { client: v.client, title: v.title, status: v.status, manager: v.manager, services: v.services,
-        amount: Number(v.amount) || 0, periodDays: Number(v.periodDays) || 14 });
-      save(); rerender();
+        amount: Number(v.amount) || 0, periodDays: Number(v.periodDays) || 14, autoRenew: v.autoRenew !== 'Нет' });
+      ensureSchedule(p); save(); rerender();
     },
     onDelete: isNew ? null : () => { db.projects = db.projects.filter((x) => x !== p); save(); location.hash = '#/'; },
   });
+}
+
+// ---------- экспорт ----------
+// Таблица копируется в буфер: вставьте её в Excel или Google Таблицы.
+function exportTable(header, rows) {
+  const cell = (v) => String(v ?? '').replace(/[\t\r\n]+/g, ' ');
+  const tsv = [header, ...rows].map((r) => r.map(cell).join('\t')).join('\n');
+  const fallback = () => {
+    const ta = h('textarea', { style: 'min-height:180px;font-size:12px', readonly: true });
+    ta.value = tsv;
+    const dlg = h('dialog', {}, h('h2', {}, 'Выделите и скопируйте таблицу'), ta,
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: () => dlg.close() }, 'Закрыть')));
+    dlg.addEventListener('close', () => dlg.remove());
+    document.body.append(dlg); dlg.showModal(); ta.select();
+  };
+  try {
+    navigator.clipboard.writeText(tsv).then(
+      () => ask('Таблица скопирована. Откройте Excel или Google Таблицы и вставьте (Ctrl+V).'), fallback);
+  } catch { fallback(); }
+}
+
+function exportProjects() {
+  exportTable(['Клиент', 'Суть', 'Статус', 'Направления', 'Ответственный', 'Сумма за период', 'Период, дн.', 'Следующая оплата', 'Сумма', 'Открытых задач'],
+    db.projects.map((p) => { const n = nextPayment(p); return [p.client, p.title, p.status, p.services.join(', '), p.manager,
+      p.amount, p.periodDays, n ? n.date : '', n ? n.amount : '', openTasks(p).length]; }));
+}
+
+function exportPayments() {
+  exportTable(['Клиент', 'Дата', 'Сумма', 'Статус', 'Комментарий'],
+    db.projects.flatMap((p) => p.payments.map((x) => [p.client, x.date, x.amount, isOverdue(x) ? 'Просрочена' : x.status, x.note]))
+      .sort((a, b) => a[1].localeCompare(b[1])));
+}
+
+// ---------- панель «Нужно внимание» ----------
+function alertsPanel() {
+  const t = today();
+  const items = [];
+  const label = (d) => d === t ? 'сегодня' : d === addDays(t, 1) ? 'завтра' : fmtDate(d);
+  for (const p of db.projects.filter((x) => x.status !== 'Завершён')) {
+    for (const x of p.payments.filter((y) => y.status !== 'Оплачено')) {
+      if (x.date < t) items.push({ rank: 0, cls: 'bad', p, tab: 'payments', text: `Просрочена оплата ${fmtDate(x.date)} · ${money(x.amount)}` });
+      else if (x.date <= addDays(t, 2)) items.push({ rank: 1, cls: 'warn', p, tab: 'payments', text: `Ждём оплату ${label(x.date)} · ${money(x.amount)}` });
+    }
+    for (const x of p.tasks.filter((y) => y.status !== 'Готово' && y.due && y.due <= t)) {
+      items.push({ rank: x.due < t ? 2 : 3, cls: x.due < t ? 'bad' : 'warn', p, tab: 'tasks', text: `${x.due < t ? 'Просрочена задача' : 'Задача на сегодня'}: ${x.title}${x.assignee ? ' (' + x.assignee + ')' : ''}` });
+    }
+  }
+  items.sort((a, b) => a.rank - b.rank);
+  const shown = items.slice(0, 7);
+  return h('div', { class: 'panel', style: 'margin-bottom:20px' },
+    h('h2', {}, 'Нужно внимание'),
+    items.length ? h('div', {}, shown.map((i) => h('div', { class: 'list-item' }, chip(i.cls === 'bad' ? 'срочно' : 'скоро', i.cls),
+      h('div', { class: 'grow' }, h('a', { href: `#/p/${i.p.id}/${i.tab}` }, i.p.client), h('span', { class: 'muted' }, ' · ' + i.text)))),
+      items.length > shown.length && h('div', { class: 'hint', style: 'padding-top:8px' }, `и ещё ${items.length - shown.length}`))
+      : h('div', { class: 'muted' }, 'Просрочек и срочных оплат нет.'));
+}
+
+// ---------- экран: календарь недели ----------
+let weekOffset = 0;
+
+function viewCalendar() {
+  const mon = startOfWeek(addDays(today(), weekOffset * 7));
+  const days = Array.from({ length: 7 }, (_, i) => addDays(mon, i));
+  const active = db.projects.filter((p) => p.status !== 'Завершён');
+  const wd = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+  const go = (n) => { weekOffset = n === 0 ? 0 : weekOffset + n; route(); };
+  return h('div', {},
+    h('h1', {}, 'Календарь'), h('div', { class: 'sub' }, 'Оплаты и сроки задач по всем проектам на неделю'),
+    h('div', { class: 'row', style: 'margin-bottom:16px' },
+      h('button', { class: 'btn', onclick: () => go(-1) }, '←'), h('button', { class: 'btn', onclick: () => go(0) }, 'Эта неделя'),
+      h('button', { class: 'btn', onclick: () => go(1) }, '→'),
+      h('b', {}, `${fmtDate(days[0])} — ${fmtDate(days[6])}`)),
+    h('div', { class: 'week' }, days.map((d, i) => {
+      const pays = active.flatMap((p) => p.payments.filter((x) => x.date === d).map((x) => ({ p, x })));
+      const tasks = active.flatMap((p) => p.tasks.filter((x) => x.due === d && x.status !== 'Готово').map((x) => ({ p, x })));
+      return h('div', { class: 'day' + (d === today() ? ' today' : '') },
+        h('div', { class: 'day-h' }, h('b', {}, wd[i]), ' ', new Date(d + 'T00:00:00').getDate()),
+        pays.map(({ p, x }) => h('div', { class: 'item ' + (x.status === 'Оплачено' ? 'ok' : isOverdue(x) ? 'bad' : 'warn'),
+          onclick: () => { location.hash = `#/p/${p.id}/payments`; } }, `${p.client} · ${money(x.amount)}`)),
+        tasks.map(({ p, x }) => h('div', { class: 'item' + (taskOverdue(x) ? ' bad' : ''), onclick: () => { location.hash = `#/p/${p.id}/tasks`; } },
+          `${x.title} · ${p.client}`)),
+        !pays.length && !tasks.length && h('div', { class: 'hint' }, '—'));
+    })));
 }
 
 // ---------- экран: проекты ----------
@@ -252,6 +404,7 @@ function viewProjects() {
       stat(money(expected.reduce((s, x) => s + x.amount, 0)), 'ожидается за 14 дней'),
       stat(money(overdue.reduce((s, x) => s + x.amount, 0)), `просрочено оплат: ${overdue.length}`, overdue.length),
       stat(overdueTasks.length, 'просроченных задач', overdueTasks.length)),
+    alertsPanel(),
     h('div', { class: 'row toolbar', style: 'margin-bottom:16px' },
       h('input', { type: 'search', placeholder: 'Поиск по клиенту…', value: filters.q, oninput: (e) => { filters.q = e.target.value; draw(); } }),
       h('select', { onchange: (e) => { filters.status = e.target.value; draw(); } },
@@ -259,6 +412,7 @@ function viewProjects() {
       h('select', { onchange: (e) => { filters.owner = e.target.value; draw(); } },
         [h('option', { value: '' }, 'Все ответственные'), ...allPeople().map((n) => h('option', { value: n, selected: filters.owner === n }, n))]),
       h('span', { class: 'spacer' }),
+      h('button', { class: 'btn', onclick: exportProjects }, 'Скопировать для Excel'),
       h('button', { class: 'btn primary', onclick: () => editProject(null) }, '+ Новый проект')),
     (draw(), list));
 }
@@ -363,14 +517,18 @@ function tabProcesses(p, rerender) {
 
 function taskForm(p, t, rerender, preset = {}) {
   openForm({
-    title: t ? 'Задача' : 'Новая задача', values: t || { status: 'К выполнению', service: p.services[0] || '', assignee: p.manager, ...preset },
+    title: t ? 'Задача' : 'Новая задача', values: t ? { ...t, repeat: t.repeat || 'Нет' } : { status: 'К выполнению', service: p.services[0] || '', assignee: p.manager, repeat: 'Нет', ...preset },
     fields: [
       { key: 'title', label: 'Что сделать', required: true },
       { key: 'assignee', label: 'Исполнитель', list: true }, { key: 'due', label: 'Срок', type: 'date' },
       { key: 'service', label: 'Направление', type: 'select', options: ['', ...SERVICES] },
       { key: 'status', label: 'Статус', type: 'select', options: TASK_COLS },
+      { key: 'repeat', label: 'Повторять (после выполнения создастся следующая)', type: 'select', options: REPEATS },
     ],
-    onSave: (v) => { if (t) Object.assign(t, v); else p.tasks.push({ id: uid(), ...v }); save(); rerender(); },
+    onSave: (v) => {
+      if (t) { const { status, ...rest } = v; Object.assign(t, rest); setTaskStatus(p, t, status); } else p.tasks.push({ id: uid(), ...v });
+      save(); rerender();
+    },
     onDelete: t && (() => { p.tasks = p.tasks.filter((x) => x !== t); save(); rerender(); }),
   });
 }
@@ -379,7 +537,7 @@ function tabTasks(p, rerender) {
   const card = (t) => h('div', { class: 'task', draggable: 'true', onclick: () => taskForm(p, t, rerender),
     ondragstart: (e) => e.dataTransfer.setData('text/plain', t.id) },
     h('div', { class: 't' }, t.title),
-    h('div', { class: 'meta' }, t.assignee && h('span', {}, t.assignee), t.service && h('span', {}, t.service),
+    h('div', { class: 'meta' }, t.assignee && h('span', {}, t.assignee), t.service && h('span', {}, t.service), t.repeat && t.repeat !== 'Нет' && h('span', {}, '↻ ' + t.repeat),
       t.due && h('span', { class: taskOverdue(t) ? 'bad' : '' }, (taskOverdue(t) ? 'просрочено · ' : '') + fmtDate(t.due))));
   return h('div', {},
     h('div', { class: 'row', style: 'margin-bottom:14px' }, h('span', { class: 'muted' }, 'Перетаскивайте карточки между колонками'),
@@ -391,7 +549,7 @@ function tabTasks(p, rerender) {
         ondrop: (e) => {
           e.preventDefault();
           const t = p.tasks.find((x) => x.id === e.dataTransfer.getData('text/plain'));
-          if (t) { t.status = c; save(); rerender(); }
+          if (t) { setTaskStatus(p, t, c); save(); rerender(); }
         } },
         h('h4', {}, `${c} · ${p.tasks.filter((t) => t.status === c).length}`),
         p.tasks.filter((t) => t.status === c).sort((a, b) => (a.due || '9').localeCompare(b.due || '9')).map(card));
@@ -409,7 +567,7 @@ function payForm(p, x, rerender) {
     onSave: (v) => {
       v.amount = Number(v.amount) || 0;
       if (x) Object.assign(x, v); else p.payments.push({ id: uid(), ...v });
-      p.payments.sort((a, b) => a.date.localeCompare(b.date)); save(); rerender();
+      p.payments.sort((a, b) => a.date.localeCompare(b.date)); if (v.status === 'Оплачено') ensureSchedule(p); save(); rerender();
     },
     onDelete: x && (() => { p.payments = p.payments.filter((y) => y !== x); save(); rerender(); }),
   });
@@ -443,7 +601,7 @@ function tabPayments(p, rerender) {
         h('td', {}, fmtDate(x.date)), h('td', { class: 'muted' }, x.note), h('td', { class: 'num' }, money(x.amount)),
         h('td', {}, chip(isOverdue(x) ? 'Просрочена' : x.status, x.status === 'Оплачено' ? 'ok' : isOverdue(x) ? 'bad' : 'warn')),
         h('td', { class: 'num' },
-          x.status !== 'Оплачено' && h('button', { class: 'btn small', onclick: () => { x.status = 'Оплачено'; save(); rerender(); } }, 'Оплачено '),
+          x.status !== 'Оплачено' && h('button', { class: 'btn small', onclick: () => { markPaid(p, x); rerender(); } }, 'Оплачено '),
           h('button', { class: 'btn small ghost', onclick: () => payForm(p, x, rerender) }, 'Изменить'))))))
       : h('div', { class: 'empty' }, 'Оплат пока нет — нажмите «Сгенерировать график»')));
 }
@@ -507,7 +665,8 @@ function viewPayments() {
   const allPays = db.projects.flatMap((p) => p.payments);
   const inMonth = allPays.filter((x) => monthKey(x.date) === m);
   return h('div', {},
-    h('h1', {}, 'Оплаты'), h('div', { class: 'sub' }, 'Календарь предоплат по всем проектам'),
+    h('div', { class: 'row' }, h('h1', {}, 'Оплаты'), h('span', { class: 'spacer' }), h('button', { class: 'btn', onclick: exportPayments }, 'Скопировать для Excel')),
+    h('div', { class: 'sub' }, 'Календарь предоплат по всем проектам'),
     h('div', { class: 'stats' },
       stat(money(inMonth.filter((x) => x.status === 'Оплачено').reduce((s, x) => s + x.amount, 0)), 'получено в этом месяце'),
       stat(money(inMonth.filter((x) => x.status !== 'Оплачено').reduce((s, x) => s + x.amount, 0)), 'ещё ожидается в этом месяце'),
@@ -522,7 +681,7 @@ function viewPayments() {
         h('td', { class: 'muted' }, x.note), h('td', { class: 'num' }, money(x.amount)),
         h('td', {}, isOverdue(x) && chip('Просрочена', 'bad')),
         h('td', { class: 'num' }, x.status !== 'Оплачено'
-          ? h('button', { class: 'btn small', onclick: () => { x.status = 'Оплачено'; save(); route(); } }, 'Оплачено')
+          ? h('button', { class: 'btn small', onclick: () => { markPaid(p, x); route(); } }, 'Оплачено')
           : h('button', { class: 'btn small ghost', onclick: () => { x.status = 'Ожидается'; save(); route(); } }, 'Вернуть'),
           ' ', h('button', { class: 'btn small ghost', onclick: () => payForm(p, x, route) }, 'Изменить'))))))))
       : h('div', { class: 'empty panel' }, 'Здесь пока пусто'));
@@ -544,7 +703,7 @@ function viewTasks() {
         onchange: (e) => { taskFilter.hideDone = e.target.checked; route(); } }), 'Скрыть выполненные')),
     h('div', { class: 'panel' }, rows.length ? h('table', {}, h('tbody', {}, rows.map(({ p, t }) => h('tr', { class: t.status === 'Готово' ? 'done' : taskOverdue(t) ? 'overdue' : '' },
       h('td', { style: 'width:30px' }, h('input', { type: 'checkbox', style: 'width:auto', checked: t.status === 'Готово',
-        onchange: (e) => { t.status = e.target.checked ? 'Готово' : 'К выполнению'; save(); route(); } })),
+        onchange: (e) => { setTaskStatus(p, t, e.target.checked ? 'Готово' : 'К выполнению'); save(); route(); } })),
       h('td', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); taskForm(p, t, route); } }, t.title)), h('td', {}, h('a', { href: `#/p/${p.id}/tasks` }, p.client)),
       h('td', { class: 'muted' }, t.assignee), h('td', {}, t.service && chip(t.service)),
       h('td', { class: 'num' }, t.due && h('span', { class: taskOverdue(t) ? 'bad' : '', style: taskOverdue(t) ? 'color:var(--bad);font-weight:600' : '' }, fmtDate(t.due)))))))
@@ -588,7 +747,7 @@ function viewTeam() {
 // ---------- роутер ----------
 function renderNav() {
   const overduePay = db.projects.flatMap((p) => p.payments).filter(isOverdue).length;
-  const items = [['#/', 'Проекты', 0], ['#/payments', 'Оплаты', overduePay], ['#/tasks', 'Задачи', 0], ['#/team', 'Команда', 0]];
+  const items = [['#/', 'Проекты', 0], ['#/calendar', 'Календарь', 0], ['#/payments', 'Оплаты', overduePay], ['#/tasks', 'Задачи', 0], ['#/team', 'Команда', 0]];
   const hash = location.hash || '#/';
   const nav = document.getElementById('nav');
   nav.replaceChildren(...items.map(([href, label, n]) => h('a', {
@@ -609,6 +768,7 @@ function route() {
   else if (hash.startsWith('#/payments')) view = viewPayments();
   else if (hash.startsWith('#/tasks')) view = viewTasks();
   else if (hash.startsWith('#/team')) view = viewTeam();
+  else if (hash.startsWith('#/calendar')) view = viewCalendar();
   else view = viewProjects();
   main.replaceChildren(view);
   window.scrollTo(0, scroll);
