@@ -178,3 +178,20 @@ a { color: var(--accent); }
 .item.bad { background: var(--bad-soft); }
 @media (max-width: 1100px) { .week { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 560px) { .week { grid-template-columns: 1fr; } .day { min-height: 0; } }
+
+.cal-title { font-size: 17px; margin-left: 6px; }
+.month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
+.mhead { font-size: 12px; color: var(--muted); text-align: center; padding: 2px 0; }
+.mcell { background: var(--panel); border-radius: 10px; padding: 6px; min-height: 104px; cursor: pointer; box-shadow: var(--shadow); min-width: 0; position: relative; }
+.mcell:hover { outline: 1px solid var(--accent); }
+.mcell.other { opacity: .5; }
+.mcell.today { outline: 2px solid var(--accent); }
+.mnum { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.mcell .item, .day .item { cursor: pointer; }
+.mdots { display: none; }
+.day { cursor: pointer; }
+@media (max-width: 700px) {
+  .mcell { min-height: 54px; padding: 4px; }
+  .mcell .item, .mcell .hint { display: none; }
+  .mdots { display: inline-block; background: var(--accent-soft); color: var(--accent); border-radius: 10px; padding: 0 7px; font-size: 12px; }
+}

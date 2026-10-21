@@ -140,6 +140,8 @@ function makeProject(v) {
   };
   const tpl = TEMPLATES[v.template] || TEMPLATES['Пустой проект'];
   p.services = [...new Set([...p.services, ...tpl.services])];
+  p.serviceItems = p.services.map((s) => ({ id: uid(), service: s, amount: Math.round(p.amount / p.services.length) }));
+  if (p.services.length > 1 && p.amount) p.splitGuess = true;
   for (const s of p.services) {
     for (const name of STD_PROCESSES[s] || []) p.processes.push({ id: uid(), service: s, name, owner: p.manager, note: '' });
   }
@@ -150,10 +152,10 @@ function makeProject(v) {
   return p;
 }
 
-function generatePayments(p, from, count) {
+function generatePayments(p, from, count, amount = p.amount) {
   let d = from;
   for (let i = 0; i < count; i++) {
-    p.payments.push({ id: uid(), date: d, amount: p.amount, status: 'Ожидается', note: 'Предоплата' });
+    p.payments.push({ id: uid(), date: d, amount, status: 'Ожидается', note: 'Предоплата' });
     d = addDays(d, p.periodDays);
   }
   p.payments.sort((a, b) => a.date.localeCompare(b.date));
@@ -207,10 +209,10 @@ function ask(message, onYes) {
   dlg.showModal();
 }
 
-function openForm({ title, fields, values = {}, onSave, onDelete, saveLabel = 'Сохранить' }) {
+function openForm({ title, fields, values = {}, onSave, onDelete, saveLabel = 'Сохранить', intro }) {
   const dlg = h('dialog');
   const inputs = {};
-  const form = h('form', { method: 'dialog' }, h('h2', {}, title));
+  const form = h('form', { method: 'dialog' }, h('h2', {}, title), intro && h('p', { class: 'hint' }, intro));
   for (const f of fields) {
     let el;
     const val = values[f.key] ?? f.default ?? '';
@@ -275,7 +277,9 @@ function editProject(p, rerender) {
   const isNew = !p;
   const values = isNew ? { autoRenew: 'Да', firstPayment: today() } : { ...p, autoRenew: p.autoRenew === false ? 'Нет' : 'Да' };
   openForm({
-    title: isNew ? 'Новый проект' : 'Параметры проекта', fields: isNew ? newProjectFields : projectFields, values,
+    title: isNew ? 'Новый проект' : 'Параметры проекта', values,
+    fields: isNew ? newProjectFields : projectFields.filter((f) => f.key !== 'services' && f.key !== 'amount'),
+    intro: isNew ? null : 'Услуги и их стоимость меняются на вкладке «Услуги».',
     onSave: (v) => {
       if (isNew) {
         const np = makeProject({ ...v, autoRenew: v.autoRenew !== 'Нет' });
@@ -284,8 +288,8 @@ function editProject(p, rerender) {
         location.hash = '#/p/' + np.id + '/overview';
         return;
       }
-      Object.assign(p, { client: v.client, title: v.title, status: v.status, manager: v.manager, services: v.services,
-        amount: Number(v.amount) || 0, periodDays: Number(v.periodDays) || 14, autoRenew: v.autoRenew !== 'Нет' });
+      Object.assign(p, { client: v.client, title: v.title, status: v.status, manager: v.manager,
+        periodDays: Number(v.periodDays) || 14, autoRenew: v.autoRenew !== 'Нет' });
       ensureSchedule(p); save(); rerender();
     },
     onDelete: isNew ? null : () => { db.projects = db.projects.filter((x) => x !== p); save(); location.hash = '#/'; },
@@ -347,32 +351,118 @@ function alertsPanel() {
       : h('div', { class: 'muted' }, 'Просрочек и срочных оплат нет.'));
 }
 
-// ---------- экран: календарь недели ----------
-let weekOffset = 0;
+// ---------- экран: календарь (месяц / неделя / день) ----------
+let calMode = 'month';
+let calAnchor = null;
+const WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+const monthStart = (s) => s.slice(0, 7) + '-01';
+const addMonths = (s, n) => iso(new Date(Number(s.slice(0, 4)), Number(s.slice(5, 7)) - 1 + n, 1));
+
+function dayItems(d) {
+  const active = db.projects.filter((p) => p.status !== 'Завершён');
+  return {
+    pays: active.flatMap((p) => p.payments.filter((x) => x.date === d).map((x) => ({ p, x }))),
+    tasks: active.flatMap((p) => p.tasks.filter((x) => x.due === d && x.status !== 'Готово').map((x) => ({ p, x }))),
+  };
+}
+
+function calItems(d, limit = 99) {
+  const { pays, tasks } = dayItems(d);
+  const all = [
+    ...pays.map(({ p, x }) => h('div', { class: 'item ' + (x.status === 'Оплачено' ? 'ok' : isOverdue(x) ? 'bad' : 'warn'),
+      title: 'Оплата', onclick: (e) => { e.stopPropagation(); location.hash = `#/p/${p.id}/payments`; } }, `${p.client} · ${money(x.amount)}`)),
+    ...tasks.map(({ p, x }) => h('div', { class: 'item' + (taskOverdue(x) ? ' bad' : ''), title: 'Задача',
+      onclick: (e) => { e.stopPropagation(); location.hash = `#/p/${p.id}/tasks`; } }, `${x.title} · ${p.client}`)),
+  ];
+  return { shown: all.slice(0, limit), more: all.length - limit, total: all.length };
+}
 
 function viewCalendar() {
-  const mon = startOfWeek(addDays(today(), weekOffset * 7));
-  const days = Array.from({ length: 7 }, (_, i) => addDays(mon, i));
-  const active = db.projects.filter((p) => p.status !== 'Завершён');
-  const wd = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-  const go = (n) => { weekOffset = n === 0 ? 0 : weekOffset + n; route(); };
+  const anchor = calAnchor || today();
+  const move = (n) => {
+    if (calMode === 'month') { const t = addMonths(anchor, n); calAnchor = monthKey(t) === monthKey(today()) ? today() : t; }
+    else calAnchor = addDays(anchor, n * (calMode === 'week' ? 7 : 1));
+    route();
+  };
+  const setMode = (m) => { calMode = m; route(); };
+  const mon = startOfWeek(anchor);
+  const cap = (s) => s[0].toUpperCase() + s.slice(1);
+  const title = calMode === 'month' ? cap(monthName(monthKey(anchor)))
+    : calMode === 'week' ? `${fmtDate(mon)} — ${fmtDate(addDays(mon, 6))}`
+    : cap(new Date(anchor + 'T00:00:00').toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }));
+
+  let body;
+  if (calMode === 'month') {
+    const first = monthStart(anchor);
+    const gridStart = startOfWeek(first);
+    const lastDay = addDays(addMonths(first, 1), -1);
+    const rows = Math.ceil(((new Date(lastDay) - new Date(gridStart)) / 864e5 + 1) / 7);
+    const cells = Array.from({ length: rows * 7 }, (_, i) => addDays(gridStart, i));
+    body = h('div', { class: 'month' },
+      WEEKDAYS.map((w) => h('div', { class: 'mhead' }, w)),
+      cells.map((d) => {
+        const it = calItems(d, 3);
+        return h('div', { class: 'mcell' + (monthKey(d) !== monthKey(anchor) ? ' other' : '') + (d === today() ? ' today' : ''),
+          onclick: () => { calAnchor = d; calMode = 'day'; route(); } },
+          h('div', { class: 'mnum' }, new Date(d + 'T00:00:00').getDate()),
+          it.shown, it.more > 0 && h('div', { class: 'hint' }, `ещё ${it.more}`),
+          it.total > 0 && h('span', { class: 'mdots' }, it.total));
+      }));
+  } else if (calMode === 'week') {
+    body = h('div', { class: 'week' }, Array.from({ length: 7 }, (_, i) => addDays(mon, i)).map((d, i) => {
+      const it = calItems(d);
+      return h('div', { class: 'day' + (d === today() ? ' today' : ''), onclick: () => { calAnchor = d; calMode = 'day'; route(); } },
+        h('div', { class: 'day-h' }, h('b', {}, WEEKDAYS[i]), ' ', new Date(d + 'T00:00:00').getDate()),
+        it.shown, !it.total && h('div', { class: 'hint' }, '—'));
+    }));
+  } else {
+    const { pays, tasks } = dayItems(anchor);
+    body = h('div', { class: 'panel' },
+      !pays.length && !tasks.length && h('div', { class: 'empty' }, 'На этот день ничего не запланировано'),
+      pays.length > 0 && h('div', {}, h('h2', {}, 'Оплаты'), pays.map(({ p, x }) => h('div', { class: 'list-item' },
+        chip(x.status === 'Оплачено' ? 'Оплачено' : isOverdue(x) ? 'Просрочена' : 'Ожидается', x.status === 'Оплачено' ? 'ok' : isOverdue(x) ? 'bad' : 'warn'),
+        h('div', { class: 'grow' }, h('a', { href: `#/p/${p.id}/payments` }, p.client), h('span', { class: 'muted' }, ' · ' + x.note)),
+        h('b', {}, money(x.amount)),
+        x.status !== 'Оплачено' && h('button', { class: 'btn small', onclick: () => { markPaid(p, x); route(); } }, 'Оплачено')))),
+      tasks.length > 0 && h('div', { style: pays.length ? 'margin-top:18px' : '' }, h('h2', {}, 'Задачи'), tasks.map(({ p, x }) => h('div', { class: 'list-item' },
+        chip(x.status, x.status === 'В работе' ? '' : 'gray'),
+        h('div', { class: 'grow' }, h('a', { href: '#', onclick: (e) => { e.preventDefault(); taskForm(p, x, route); } }, x.title),
+          h('span', { class: 'muted' }, ` · ${p.client}${x.assignee ? ' · ' + x.assignee : ''}`))))));
+  }
+
+  const seg = (m, label) => h('button', { class: 'btn' + (calMode === m ? ' primary' : ''), onclick: () => setMode(m) }, label);
   return h('div', {},
-    h('h1', {}, 'Календарь'), h('div', { class: 'sub' }, 'Оплаты и сроки задач по всем проектам на неделю'),
+    h('div', { class: 'row' }, h('h1', {}, 'Календарь'), h('span', { class: 'spacer' }),
+      !window.DEMO && h('button', { class: 'btn', onclick: exportIcs }, 'Выгрузить для Google Календаря (.ics)')),
+    h('div', { class: 'sub' }, 'Оплаты и сроки задач по всем проектам'),
     h('div', { class: 'row', style: 'margin-bottom:16px' },
-      h('button', { class: 'btn', onclick: () => go(-1) }, '←'), h('button', { class: 'btn', onclick: () => go(0) }, 'Эта неделя'),
-      h('button', { class: 'btn', onclick: () => go(1) }, '→'),
-      h('b', {}, `${fmtDate(days[0])} — ${fmtDate(days[6])}`)),
-    h('div', { class: 'week' }, days.map((d, i) => {
-      const pays = active.flatMap((p) => p.payments.filter((x) => x.date === d).map((x) => ({ p, x })));
-      const tasks = active.flatMap((p) => p.tasks.filter((x) => x.due === d && x.status !== 'Готово').map((x) => ({ p, x })));
-      return h('div', { class: 'day' + (d === today() ? ' today' : '') },
-        h('div', { class: 'day-h' }, h('b', {}, wd[i]), ' ', new Date(d + 'T00:00:00').getDate()),
-        pays.map(({ p, x }) => h('div', { class: 'item ' + (x.status === 'Оплачено' ? 'ok' : isOverdue(x) ? 'bad' : 'warn'),
-          onclick: () => { location.hash = `#/p/${p.id}/payments`; } }, `${p.client} · ${money(x.amount)}`)),
-        tasks.map(({ p, x }) => h('div', { class: 'item' + (taskOverdue(x) ? ' bad' : ''), onclick: () => { location.hash = `#/p/${p.id}/tasks`; } },
-          `${x.title} · ${p.client}`)),
-        !pays.length && !tasks.length && h('div', { class: 'hint' }, '—'));
-    })));
+      h('button', { class: 'btn', onclick: () => move(-1) }, '←'),
+      h('button', { class: 'btn', onclick: () => { calAnchor = today(); route(); } }, 'Сегодня'),
+      h('button', { class: 'btn', onclick: () => move(1) }, '→'),
+      h('b', { class: 'cal-title' }, title), h('span', { class: 'spacer' }),
+      seg('month', 'Месяц'), seg('week', 'Неделя'), seg('day', 'День')),
+    body);
+}
+
+// Файл .ics открывается в Google Календаре: «Настройки → Импорт и экспорт».
+function exportIcs() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
+  const esc = (s) => String(s).replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  const ev = [];
+  for (const p of db.projects.filter((x) => x.status !== 'Завершён')) {
+    for (const x of p.payments.filter((y) => y.status !== 'Оплачено')) ev.push([`pay-${x.id}`, x.date, `Оплата: ${p.client} · ${money(x.amount)}`]);
+    for (const t of p.tasks.filter((y) => y.status !== 'Готово' && y.due)) ev.push([`task-${t.id}`, t.due, `${t.title} (${p.client})`]);
+  }
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Belkin CRM//RU', 'CALSCALE:GREGORIAN'];
+  for (const [id, d, title] of ev) {
+    lines.push('BEGIN:VEVENT', `UID:${id}@belkin-crm`, `DTSTAMP:${stamp}`, `DTSTART;VALUE=DATE:${d.replace(/-/g, '')}`,
+      `DTEND;VALUE=DATE:${addDays(d, 1).replace(/-/g, '')}`, `SUMMARY:${esc(title)}`, 'END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+  const url = URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/calendar;charset=utf-8' }));
+  const link = h('a', { href: url, download: 'belkin-crm.ics' });
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ---------- экран: проекты ----------
@@ -440,13 +530,13 @@ function projectCard(p) {
 }
 
 // ---------- экран: проект ----------
-const TABS = [['overview', 'Обзор'], ['processes', 'Процессы'], ['tasks', 'Задачи'], ['payments', 'Оплаты'], ['docs', 'Документы'], ['notes', 'Заметки']];
+const TABS = [['overview', 'Обзор'], ['services', 'Услуги'], ['processes', 'Процессы'], ['tasks', 'Задачи'], ['payments', 'Оплаты'], ['docs', 'Документы'], ['notes', 'Заметки']];
 
 function viewProject(id, tab) {
   const p = findProject(id);
   if (!p) return h('div', { class: 'empty' }, 'Проект не найден');
   const rerender = () => route();
-  const body = { overview: tabOverview, processes: tabProcesses, tasks: tabTasks, payments: tabPayments, docs: tabDocs, notes: tabNotes }[tab] || tabOverview;
+  const body = { overview: tabOverview, services: tabServices, processes: tabProcesses, tasks: tabTasks, payments: tabPayments, docs: tabDocs, notes: tabNotes }[tab] || tabOverview;
   return h('div', {},
     h('a', { class: 'back', href: '#/' }, '← Все проекты'),
     h('div', { class: 'head' },
@@ -459,6 +549,117 @@ function viewProject(id, tab) {
 }
 
 const field = (label, value) => [h('div', { class: 'field-label' }, label), h('div', { class: 'pre' }, value || h('span', { class: 'muted' }, '—'))];
+
+const serviceOptions = (p) => [...new Set([...SERVICES, ...p.services, ...p.processes.map((x) => x.service)])];
+const sumItems = (p) => p.serviceItems.reduce((s, i) => s + (Number(i.amount) || 0), 0);
+
+// Старые проекты без состава услуг: сумма делится между услугами, дальше её уточняют на вкладке «Услуги».
+function migrate() {
+  let changed = false;
+  for (const p of db.projects) {
+    if (p.serviceItems) continue;
+    p.serviceItems = p.services.map((s) => ({ id: uid(), service: s, amount: Math.round((p.amount || 0) / p.services.length) }));
+    if (p.services.length > 1 && p.amount) p.splitGuess = true;
+    changed = true;
+  }
+  return changed;
+}
+
+const YES_UPDATE = 'Да, обновить суммы будущих неоплаченных платежей';
+const NO_UPDATE = 'Нет, оставить как есть';
+
+// Любое изменение состава услуг: пересчитывает сумму и список услуг, пишет запись в заметки.
+function changeServices(p, description, mutate, updatePayments) {
+  const before = p.amount;
+  mutate();
+  p.services = [...new Set(p.serviceItems.map((i) => i.service))];
+  if (p.serviceItems.length) p.amount = sumItems(p);
+  p.splitGuess = false;
+  if (updatePayments) p.payments.forEach((x) => { if (x.status !== 'Оплачено' && x.date >= today()) x.amount = p.amount; });
+  p.notes.unshift({ id: uid(), date: new Date().toISOString(),
+    text: `Изменён пакет услуг: ${description}. Сумма за период: ${money(before)} → ${money(p.amount)}.` });
+  save();
+}
+
+function tabServices(p, rerender) {
+  const total = p.serviceItems.length ? sumItems(p) : p.amount;
+  const countOf = (s) => ({ proc: p.processes.filter((x) => x.service === s).length, tasks: p.tasks.filter((t) => t.service === s && t.status !== 'Готово').length });
+  const updateField = { key: 'upd', label: 'Платежи', type: 'select', options: [YES_UPDATE, NO_UPDATE] };
+
+  const addService = () => {
+    const free = SERVICES.filter((s) => !p.services.includes(s));
+    openForm({
+      title: 'Добавить услугу', saveLabel: 'Добавить', values: { service: free[0] || 'Другое', amount: '', procs: 'Да', tasks: 'Да', upd: YES_UPDATE },
+      intro: 'Сумма услуги добавится к стоимости проекта за период.',
+      fields: [
+        { key: 'service', label: 'Услуга', type: 'select', options: [...free, 'Другое'] },
+        { key: 'custom', label: 'Своё название (если выбрано «Другое»)' },
+        { key: 'amount', label: 'Стоимость за период, ₽', type: 'number', required: true },
+        { key: 'procs', label: 'Добавить типовые процессы?', type: 'select', options: ['Да', 'Нет'] },
+        { key: 'tasks', label: 'Добавить типовые задачи?', type: 'select', options: ['Да', 'Нет'] },
+        updateField,
+      ],
+      onSave: (v) => {
+        const name = v.service === 'Другое' ? (v.custom || 'Другое') : v.service;
+        changeServices(p, `добавлено «${name}»`, () => {
+          p.serviceItems.push({ id: uid(), service: name, amount: Number(v.amount) || 0 });
+          if (v.procs === 'Да') for (const n of STD_PROCESSES[name] || []) p.processes.push({ id: uid(), service: name, name: n, owner: p.manager, note: '' });
+          const tplName = { 'SMM': 'SMM-ведение', 'Таргет': 'Таргетированная реклама', 'Контекст': 'Контекстная реклама', 'Сайты': 'Сайт под ключ' }[name];
+          if (v.tasks === 'Да' && tplName) {
+            for (const [title, service, days, repeat] of TEMPLATES[tplName].tasks) {
+              p.tasks.push({ id: uid(), title, service, assignee: p.manager, due: addDays(today(), days), status: 'К выполнению', repeat: repeat || 'Нет' });
+            }
+          }
+        }, v.upd === YES_UPDATE);
+        rerender();
+      },
+    });
+  };
+
+  const editAmount = (i) => openForm({
+    title: `Стоимость: ${i.service}`, values: { amount: i.amount, upd: YES_UPDATE },
+    fields: [{ key: 'amount', label: 'Стоимость за период, ₽', type: 'number', required: true }, updateField],
+    onSave: (v) => { changeServices(p, `стоимость «${i.service}» изменена`, () => { i.amount = Number(v.amount) || 0; }, v.upd === YES_UPDATE); rerender(); },
+  });
+
+  const removeService = (i) => {
+    const c = countOf(i.service);
+    openForm({
+      title: `Убрать услугу «${i.service}»`, saveLabel: 'Убрать услугу',
+      values: { tasks: c.tasks ? 'Удалить открытые задачи по этой услуге' : 'Оставить', upd: YES_UPDATE },
+      intro: `Стоимость проекта уменьшится на ${money(i.amount)}. Процессов по услуге: ${c.proc} (они будут удалены). Открытых задач: ${c.tasks}. Выполненные задачи сохранятся.`,
+      fields: [
+        { key: 'tasks', label: 'Открытые задачи по этой услуге', type: 'select', options: ['Удалить открытые задачи по этой услуге', 'Оставить'] },
+        updateField,
+      ],
+      onSave: (v) => {
+        changeServices(p, `убрано «${i.service}»`, () => {
+          p.serviceItems = p.serviceItems.filter((x) => x !== i);
+          p.processes = p.processes.filter((x) => x.service !== i.service);
+          if (v.tasks.startsWith('Удалить')) p.tasks = p.tasks.filter((t) => t.service !== i.service || t.status === 'Готово');
+        }, v.upd === YES_UPDATE);
+        rerender();
+      },
+    });
+  };
+
+  return h('div', {},
+    h('div', { class: 'row', style: 'margin-bottom:14px' },
+      h('span', { class: 'muted' }, 'Что входит в пакет и сколько стоит за период'), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn primary', onclick: addService }, '+ Добавить услугу')),
+    p.splitGuess && h('div', { class: 'panel hint' }, 'Общая сумма была поделена между услугами поровну. Уточните стоимость каждой кнопкой «Стоимость».'),
+    h('div', { class: 'panel' },
+      p.serviceItems.length ? h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Услуга'), h('th', {}, 'Состав'), h('th', { class: 'num' }, 'За период'), h('th', {}))),
+        h('tbody', {}, p.serviceItems.map((i) => { const c = countOf(i.service); return h('tr', {},
+          h('td', {}, chip(i.service)), h('td', { class: 'muted' }, `процессов: ${c.proc} · открытых задач: ${c.tasks}`),
+          h('td', { class: 'num' }, money(i.amount)),
+          h('td', { class: 'num' }, h('button', { class: 'btn small', onclick: () => editAmount(i) }, 'Стоимость'), ' ',
+            h('button', { class: 'btn small danger ghost', onclick: () => removeService(i) }, 'Убрать'))); }),
+          h('tr', {}, h('td', {}, h('b', {}, 'Итого за период')), h('td', {}), h('td', { class: 'num' }, h('b', {}, money(total))), h('td', {}))))
+        : h('div', { class: 'empty' }, 'Услуги пока не заданы.' + (p.amount ? ` Сейчас сумма за период указана общей: ${money(p.amount)}. Добавьте услугу, и сумма будет считаться по ним.` : ''))),
+    h('div', { class: 'hint' }, `Период предоплаты: ${p.periodDays} дн. Платежи за уже закрытые периоды не меняются.`));
+}
 
 function tabOverview(p, rerender) {
   const b = p.brief;
@@ -494,7 +695,7 @@ function tabProcesses(p, rerender) {
   const edit = (x) => openForm({
     title: x ? 'Процесс' : 'Новый процесс', values: x || { service: p.services[0] || SERVICES[0], owner: p.manager },
     fields: [
-      { key: 'service', label: 'Направление', type: 'select', options: SERVICES },
+      { key: 'service', label: 'Направление', type: 'select', options: serviceOptions(p) },
       { key: 'name', label: 'Процесс', required: true }, { key: 'owner', label: 'Ответственный', list: true },
       { key: 'note', label: 'Заметка / что входит', type: 'textarea' },
     ],
@@ -521,7 +722,7 @@ function taskForm(p, t, rerender, preset = {}) {
     fields: [
       { key: 'title', label: 'Что сделать', required: true },
       { key: 'assignee', label: 'Исполнитель', list: true }, { key: 'due', label: 'Срок', type: 'date' },
-      { key: 'service', label: 'Направление', type: 'select', options: ['', ...SERVICES] },
+      { key: 'service', label: 'Направление', type: 'select', options: ['', ...serviceOptions(p)] },
       { key: 'status', label: 'Статус', type: 'select', options: TASK_COLS },
       { key: 'repeat', label: 'Повторять (после выполнения создастся следующая)', type: 'select', options: REPEATS },
     ],
@@ -585,8 +786,9 @@ function tabPayments(p, rerender) {
       { key: 'amount', label: 'Сумма, ₽', type: 'number', required: true }, { key: 'periodDays', label: 'Через сколько дней', type: 'number' },
     ],
     onSave: (v) => {
-      p.amount = Number(v.amount) || 0; p.periodDays = Number(v.periodDays) || 14;
-      generatePayments(p, v.from, Math.min(Math.max(Number(v.count) || 1, 1), 52)); save(); rerender();
+      if (!p.serviceItems.length) p.amount = Number(v.amount) || 0;
+      p.periodDays = Number(v.periodDays) || 14;
+      generatePayments(p, v.from, Math.min(Math.max(Number(v.count) || 1, 1), 52), Number(v.amount) || 0); save(); rerender();
     },
   });
   return h('div', {},
@@ -778,6 +980,7 @@ async function init() {
   const r = await fetch('/api/db');
   db = await r.json();
   if (db.empty) { db = demoData(); save(); }
+  if (migrate()) save();
   document.getElementById('demo-clear').addEventListener('click', () => {
     ask('Удалить демо-проекты и начать с чистого листа?', () => { db = { projects: [] }; save(); location.hash = '#/'; route(); });
   });
